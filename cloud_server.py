@@ -107,10 +107,11 @@ def add_reminder():
     body = request.get_json(force=True)
     time_str = body.get("time", "")
     message = body.get("message", "reminder")
+    display_time = body.get("display_time", time_str)  # falls back to raw time if not provided
     if not re.match(r"^\d{2}:\d{2}$", time_str):
         return jsonify({"error": "time must be HH:MM"}), 400
     with lock:
-        reminders.append({"time": time_str, "message": message})
+        reminders.append({"time": time_str, "message": message, "display_time": display_time})
         save_data()
     return jsonify({"ok": True})
 
@@ -149,7 +150,7 @@ def api_status():
     """Public read-only status — no auth, so your phone/KWGT can poll it freely."""
     with lock:
         now = time.time()
-        rem = [{"time": r["time"], "message": r["message"]} for r in reminders]
+        rem = [{"time": r.get("display_time", r["time"]), "message": r["message"]} for r in reminders]
         tim = [{"label": t["label"], "remaining": _format_remaining(t["end_time"] - now)} for t in timers]
     return jsonify({"reminders": rem, "timers": tim})
 
