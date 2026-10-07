@@ -264,11 +264,63 @@ DASHBOARD_HTML = """
             font-size: 0.9em;
         }
         ::-webkit-scrollbar { width: 0; }
+
+        /* ── Ambient Jarvis-style face (idle only — this cloud server has
+           no mic/speaker, so it can't reflect live listening/speaking;
+           the laptop's own dashboard shows the fully reactive version) ── */
+        .face-wrap {
+            position: relative;
+            width: 170px; height: 170px;
+            margin: 10px auto 6px;
+        }
+        .ring {
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid var(--magenta);
+            box-shadow: 0 0 10px rgba(255,60,220,0.45);
+            animation: spin 7s linear infinite;
+        }
+        .ring-inner {
+            inset: 26px;
+            border-color: var(--cyan);
+            box-shadow: 0 0 10px rgba(60,255,245,0.45);
+            animation: spin-rev 5s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes spin-rev { to { transform: rotate(-360deg); } }
+        .core {
+            position: absolute;
+            inset: 58px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(60,255,245,0.85), rgba(60,255,245,0.05) 70%);
+            filter: blur(1px);
+            animation: breathe 3.2s ease-in-out infinite;
+        }
+        @keyframes breathe {
+            0%, 100% { transform: scale(0.82); opacity: 0.65; }
+            50%      { transform: scale(1.05); opacity: 1; }
+        }
+        .state-label {
+            text-align: center;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 0.7em;
+            letter-spacing: 3px;
+            color: var(--dim);
+            margin-bottom: 18px;
+        }
     </style>
 </head>
 <body>
     <h1>DUMMY // SYS</h1>
     <div class="status-line"><span class="dot"></span>LIVE — POLLING EVERY 5s</div>
+
+    <div class="face-wrap">
+        <div class="ring"></div>
+        <div class="ring ring-inner"></div>
+        <div class="core"></div>
+    </div>
+    <div class="state-label">STANDBY</div>
 
     <h2>Reminders</h2>
     <div id="reminders"><p class="empty">loading...</p></div>
