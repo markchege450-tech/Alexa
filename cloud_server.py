@@ -23,8 +23,9 @@ from flask import Flask, jsonify, request, render_template_string, Response
 app = Flask(__name__)
 
 # ── Config (set these as environment variables in Render's dashboard) ────────
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")            # same topic as your phone's ntfy app
-API_SECRET = os.environ.get("API_SECRET", "change-me")   # shared secret so randoms can't spam your reminders
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip().strip("\"'")   # same topic as your phone's ntfy app
+# Shared secret so strangers can't add reminders. If it is not set, the write endpoints stay locked.
+API_SECRET = os.environ.get("API_SECRET", "").strip().strip("\"'")
 
 DATA_FILE = "data.json"
 
@@ -55,23 +56,32 @@ def save_data():
 
 # ── Phone push notifications ──────────────────────────────────────────────
 def send_phone_alert(title, message):
+    """Returns 'no-topic', 'ok' or 'failed' so callers (and /api/test-alert) can tell what happened."""
     if not NTFY_TOPIC:
-        return
+        print("ntfy alert skipped: NTFY_TOPIC is not set on this server")
+        return "no-topic"
     import requests
     try:
-        requests.post(
+        r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
             headers={"Title": title, "Priority": "urgent", "Tags": "loudspeaker"},
-            timeout=5,
+            timeout=8,
         )
+        if r.status_code != 200:
+            print(f"ntfy push rejected ({r.status_code}): {r.text[:200]}")
+            return "failed"
+        return "ok"
     except requests.exceptions.RequestException as e:
         print(f"ntfy push failed: {e}")
+        return "failed"
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
 def check_auth():
-    return request.headers.get("X-API-Key") == API_SECRET
+    import hmac
+    sent = request.headers.get("X-API-Key", "")
+    return bool(API_SECRET) and hmac.compare_digest(sent, API_SECRET)
 
 
 # ── Background checker thread ──────────────────────────────────────────────
@@ -114,6 +124,15 @@ def add_reminder():
         reminders.append({"time": time_str, "message": message, "display_time": display_time})
         save_data()
     return jsonify({"ok": True})
+
+
+@app.route("/api/test-alert", methods=["POST"])
+def test_alert():
+    """Lets the laptop check that this server can really reach your phone."""
+    if not check_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    result = send_phone_alert("Dummy test", "Test alert from the cloud server")
+    return jsonify({"topic_configured": bool(NTFY_TOPIC), "sent": result == "ok"})
 
 
 @app.route("/api/timers", methods=["POST"])
