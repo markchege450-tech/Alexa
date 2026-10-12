@@ -55,8 +55,13 @@ def save_data():
 
 
 # ── Phone push notifications ──────────────────────────────────────────────
-def send_phone_alert(title, message):
-    """Returns 'no-topic', 'ok' or 'failed' so callers (and /api/test-alert) can tell what happened."""
+def _ascii(text):
+    """HTTP headers cannot carry emoji; an emoji title used to crash this thread."""
+    return text.encode("ascii", "ignore").decode("ascii").strip() or "Dummy"
+
+
+def send_phone_alert(title, message, tag="alarm_clock"):
+    """Returns 'no-topic', 'ok' or 'failed'. Never raises."""
     if not NTFY_TOPIC:
         print("ntfy alert skipped: NTFY_TOPIC is not set on this server")
         return "no-topic"
@@ -65,14 +70,14 @@ def send_phone_alert(title, message):
         r = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
             data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": "urgent", "Tags": "loudspeaker"},
+            headers={"Title": _ascii(title), "Priority": "urgent", "Tags": tag},
             timeout=8,
         )
         if r.status_code != 200:
             print(f"ntfy push rejected ({r.status_code}): {r.text[:200]}")
             return "failed"
         return "ok"
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"ntfy push failed: {e}")
         return "failed"
 
@@ -84,29 +89,88 @@ def check_auth():
     return bool(API_SECRET) and hmac.compare_digest(sent, API_SECRET)
 
 
+# ── Live mirror of the laptop (face state + conversation) ─────────────────
+# The laptop posts a heartbeat every second or two while it runs. The page
+# shows it as online while heartbeats keep arriving, offline otherwise.
+# The conversation is private: it is only returned to someone who sends the secret.
+ONLINE_SECONDS = 25
+LIVE = {"state": "idle", "conversation": [], "ts": 0.0}
+live_lock = threading.Lock()
+
+
+@app.route("/api/heartbeat", methods=["POST"])
+def heartbeat():
+    if not check_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    state = body.get("state") if body.get("state") in ("idle", "listening", "thinking", "speaking") else "idle"
+    convo = []
+    for m in (body.get("conversation") or [])[-20:]:
+        if isinstance(m, dict):
+            convo.append({"speaker": str(m.get("speaker", ""))[:20], "text": str(m.get("text", ""))[:600]})
+    with live_lock:
+        LIVE.update(state=state, conversation=convo, ts=time.time())
+    return jsonify({"ok": True})
+
+
+@app.route("/api/live")
+def live():
+    now = time.time()
+    with live_lock:
+        snap = dict(LIVE)
+    online = snap["ts"] > 0 and now - snap["ts"] < ONLINE_SECONDS
+    authorized = check_auth()
+    out = {
+        "online": online,
+        "state": snap["state"] if online else "offline",
+        "last_seen": int(now - snap["ts"]) if snap["ts"] else None,
+        "locked": not authorized,
+    }
+    if authorized:
+        out["conversation"] = snap["conversation"]
+    resp = jsonify(out)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # ── Background checker thread ──────────────────────────────────────────────
-def checker_loop():
+STALE_SECONDS = 900   # an alert more than 15 minutes late is dropped (the server was asleep)
+
+
+def process_due(now=None):
+    """Remove finished reminders/timers, and alert for those whose laptop asked
+    the cloud to notify (the laptop normally schedules the alert on ntfy itself)."""
+    now = now or time.time()
+    now_str = time.strftime("%H:%M", time.gmtime(now))   # reminders from the laptop are in UTC
+    with lock:
+        due = [r for r in reminders
+               if (r["fire_at"] <= now if r.get("fire_at") else r["time"] == now_str)]
+        for r in due:
+            reminders.remove(r)
+        done = [t for t in timers if t["end_time"] <= now]
+        for t in done:
+            timers.remove(t)
+        if due or done:
+            save_data()
+    for r in due:
+        late = now - r["fire_at"] if r.get("fire_at") else 0
+        if r.get("notify", True) and late < STALE_SECONDS:
+            send_phone_alert("Reminder", r["message"], tag="alarm_clock")
+    for t in done:
+        if t.get("notify", True) and now - t["end_time"] < STALE_SECONDS:
+            send_phone_alert("Timer done", f"{t['label']} is up.", tag="stopwatch")
+    return len(due), len(done)
+
+
+def checker_loop(once=False):
     while True:
-        now_str = time.strftime("%H:%M")
-        now = time.time()
-        with lock:
-            due_reminders = [r for r in reminders if r["time"] == now_str]
-            for r in due_reminders:
-                reminders.remove(r)
-
-            done_timers = [t for t in timers if t["end_time"] <= now]
-            for t in done_timers:
-                timers.remove(t)
-
-            if due_reminders or done_timers:
-                save_data()
-
-        for r in due_reminders:
-            send_phone_alert("⏰ Reminder", r["message"])
-        for t in done_timers:
-            send_phone_alert("⏱️ Timer done", f"{t['label']} is up!")
-
-        time.sleep(20)
+        try:
+            process_due()
+        except Exception as e:      # one bad iteration must never kill the thread
+            print(f"checker error (continuing): {e}")
+        if once:
+            return
+        time.sleep(10)
 
 
 # ── API ─────────────────────────────────────────────────────────────────────
@@ -118,10 +182,14 @@ def add_reminder():
     time_str = body.get("time", "")
     message = body.get("message", "reminder")
     display_time = body.get("display_time", time_str)  # falls back to raw time if not provided
+    fire_at = body.get("fire_at")
     if not re.match(r"^\d{2}:\d{2}$", time_str):
         return jsonify({"error": "time must be HH:MM"}), 400
+    if fire_at is not None and not isinstance(fire_at, (int, float)):
+        return jsonify({"error": "fire_at must be a unix timestamp"}), 400
     with lock:
-        reminders.append({"time": time_str, "message": message, "display_time": display_time})
+        reminders.append({"time": time_str, "message": message, "display_time": display_time,
+                          "fire_at": fire_at, "notify": body.get("notify", True)})
         save_data()
     return jsonify({"ok": True})
 
@@ -148,7 +216,8 @@ def add_timer():
     with lock:
         timer_id = _next_timer_id
         _next_timer_id += 1
-        timers.append({"id": timer_id, "label": label, "end_time": time.time() + seconds})
+        timers.append({"id": timer_id, "label": label, "end_time": time.time() + seconds,
+                       "notify": body.get("notify", True)})
         save_data()
     return jsonify({"ok": True, "id": timer_id})
 
@@ -285,9 +354,7 @@ DASHBOARD_HTML = """
         }
         ::-webkit-scrollbar { width: 0; }
 
-        /* ── Ambient Jarvis-style face (idle only — this cloud server has
-           no mic/speaker, so it can't reflect live listening/speaking;
-           the laptop's own dashboard shows the fully reactive version) ── */
+        /* ── Jarvis-style face ── */
         .face-wrap {
             position: relative;
             width: 170px; height: 170px;
@@ -300,6 +367,7 @@ DASHBOARD_HTML = """
             border: 2px solid var(--magenta);
             box-shadow: 0 0 10px rgba(255,60,220,0.45);
             animation: spin 7s linear infinite;
+            transition: border-color 0.4s, box-shadow 0.4s, animation-duration 0.4s;
         }
         .ring-inner {
             inset: 26px;
@@ -316,11 +384,37 @@ DASHBOARD_HTML = """
             background: radial-gradient(circle, rgba(60,255,245,0.85), rgba(60,255,245,0.05) 70%);
             filter: blur(1px);
             animation: breathe 3.2s ease-in-out infinite;
+            transition: background 0.4s;
         }
         @keyframes breathe {
             0%, 100% { transform: scale(0.82); opacity: 0.65; }
             50%      { transform: scale(1.05); opacity: 1; }
         }
+        .bars {
+            position: absolute;
+            bottom: -22px; left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            align-items: flex-end;
+            gap: 4px;
+            height: 24px;
+            opacity: 0;
+            transition: opacity 0.25s;
+        }
+        .bars span {
+            width: 4px;
+            background: var(--cyan);
+            box-shadow: 0 0 6px var(--cyan);
+            border-radius: 2px;
+            animation: bar 0.55s ease-in-out infinite;
+        }
+        .bars span:nth-child(1){ animation-delay: 0s; }
+        .bars span:nth-child(2){ animation-delay: 0.1s; }
+        .bars span:nth-child(3){ animation-delay: 0.2s; }
+        .bars span:nth-child(4){ animation-delay: 0.1s; }
+        .bars span:nth-child(5){ animation-delay: 0s; }
+        @keyframes bar { 0%, 100% { height: 5px; } 50% { height: 22px; } }
+
         .state-label {
             text-align: center;
             font-family: 'Orbitron', sans-serif;
@@ -328,19 +422,112 @@ DASHBOARD_HTML = """
             letter-spacing: 3px;
             color: var(--dim);
             margin-bottom: 18px;
+            transition: color 0.3s;
+        }
+
+        /* listening — brighter, faster cyan rings */
+        body[data-state="listening"] .ring {
+            border-color: var(--cyan);
+            box-shadow: 0 0 16px var(--cyan);
+            animation-duration: 2.2s;
+        }
+        body[data-state="listening"] .ring-inner { animation-duration: 1.6s; }
+        body[data-state="listening"] .state-label { color: var(--cyan); text-shadow: 0 0 6px var(--cyan); }
+
+        /* thinking — fast magenta dashed spin */
+        body[data-state="thinking"] .ring {
+            border-style: dashed;
+            animation-duration: 0.9s;
+        }
+        body[data-state="thinking"] .ring-inner {
+            border-style: dashed;
+            animation-duration: 0.7s;
+        }
+        body[data-state="thinking"] .core {
+            background: radial-gradient(circle, rgba(255,60,220,0.85), rgba(255,60,220,0.05) 70%);
+            animation-duration: 0.8s;
+        }
+        body[data-state="thinking"] .state-label { color: var(--magenta); text-shadow: 0 0 6px var(--magenta); }
+
+        /* speaking — pulsing core + waveform bars */
+        body[data-state="speaking"] .core { animation: speak 0.4s ease-in-out infinite; }
+        @keyframes speak {
+            0%, 100% { transform: scale(0.88); }
+            50%      { transform: scale(1.22); }
+        }
+        body[data-state="speaking"] .bars { opacity: 1; }
+        body[data-state="speaking"] .state-label { color: var(--cyan); text-shadow: 0 0 6px var(--cyan); }
+
+        .chat-log {
+            max-height: 240px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .chat-line {
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 0.85em;
+            line-height: 1.4;
+            max-width: 88%;
+        }
+        .chat-line.you {
+            align-self: flex-end;
+            background: rgba(255,60,220,0.08);
+            border: 1px solid rgba(255,60,220,0.3);
+            color: #ffe3f8;
+        }
+        .chat-line.dummy {
+            align-self: flex-start;
+            background: rgba(60,255,245,0.07);
+            border: 1px solid rgba(60,255,245,0.28);
+            color: #dafffd;
+        }
+        .chat-line .who {
+            display: block;
+            font-size: 0.7em;
+            letter-spacing: 1px;
+            opacity: 0.6;
+            margin-bottom: 2px;
+        }
+    
+        /* ── cloud-only: offline look and the unlock box ── */
+        body[data-state="offline"] .ring, body[data-state="offline"] .ring-inner {
+            border-color: #3a4655; box-shadow: none; animation-play-state: paused;
+        }
+        body[data-state="offline"] .core {
+            background: radial-gradient(circle, rgba(90,106,122,0.55), rgba(90,106,122,0.05) 70%);
+            animation-duration: 6s;
+        }
+        body[data-state="offline"] .state-label { color: var(--dim); }
+        body[data-state="offline"] .dot { background: #566; box-shadow: none; animation: none; }
+        .hint { color: var(--dim); font-size: 0.8em; margin-bottom: 8px; }
+        .hint.bad { color: var(--magenta); }
+        .unlock { display: flex; gap: 8px; }
+        .unlock input {
+            flex: 1; min-width: 0; padding: 10px 12px; border-radius: 8px;
+            background: var(--card); color: #e8fbfa; font-family: inherit; font-size: 1em;
+            border: 1px solid rgba(60,255,245,0.3);
+        }
+        .unlock button {
+            padding: 10px 16px; border-radius: 8px; cursor: pointer;
+            background: transparent; color: var(--cyan); font-family: inherit; font-size: 1em;
+            border: 1px solid var(--cyan);
         }
     </style>
 </head>
 <body>
     <h1>DUMMY // SYS</h1>
-    <div class="status-line"><span class="dot"></span>LIVE — POLLING EVERY 5s</div>
+    <div class="status-line"><span class="dot"></span><span id="statusText">CONNECTING...</span></div>
 
     <div class="face-wrap">
         <div class="ring"></div>
         <div class="ring ring-inner"></div>
         <div class="core"></div>
+        <div class="bars"><span></span><span></span><span></span><span></span><span></span></div>
     </div>
-    <div class="state-label">STANDBY</div>
+    <div class="state-label" id="stateLabel">CONNECTING</div>
 
     <h2>Reminders</h2>
     <div id="reminders"><p class="empty">loading...</p></div>
@@ -348,23 +535,68 @@ DASHBOARD_HTML = """
     <h2>Timers</h2>
     <div id="timers"><p class="empty">loading...</p></div>
 
+    <h2>Conversation</h2>
+    <div id="chatArea"><p class="empty">loading...</p></div>
+
     <script>
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const KEY_NAME = 'dummyKey';
+    const getKey = () => { try { return localStorage.getItem(KEY_NAME) || ''; } catch (e) { return ''; } };
+    const setKey = v => { try { localStorage.setItem(KEY_NAME, v); } catch (e) { /* private mode */ } };
+    const ago = sec => sec < 60 ? sec + 's' : sec < 3600 ? Math.floor(sec / 60) + ' min' : Math.floor(sec / 3600) + ' h';
+
     async function refresh() {
         try {
-            const res = await fetch('/api/status');
+            const res = await fetch('/api/status', { cache: 'no-store' });
             const data = await res.json();
-            const remDiv = document.getElementById('reminders');
-            remDiv.innerHTML = data.reminders.length
-                ? data.reminders.map(r => `<div class="card"><span class="time">${r.time}</span> — ${r.message}</div>`).join('')
+            document.getElementById('reminders').innerHTML = data.reminders.length
+                ? data.reminders.map(r => `<div class="card"><span class="time">${esc(r.time)}</span> — ${esc(r.message)}</div>`).join('')
                 : '<p class="empty">no reminders set</p>';
-            const timDiv = document.getElementById('timers');
-            timDiv.innerHTML = data.timers.length
-                ? data.timers.map(t => `<div class="card">${t.label} — <span class="time">${t.remaining}</span> left</div>`).join('')
+            document.getElementById('timers').innerHTML = data.timers.length
+                ? data.timers.map(t => `<div class="card">${esc(t.label)} — <span class="time">${esc(t.remaining)}</span> left</div>`).join('')
                 : '<p class="empty">no active timers</p>';
-        } catch (e) { /* stay on last known state if a poll fails */ }
+        } catch (e) { /* keep what is on screen if a poll fails */ }
     }
-    refresh();
-    setInterval(refresh, 5000);
+
+    let lastSig = '';
+    function renderChat(d, key) {
+        const sig = JSON.stringify([d.locked, !!key, d.conversation || null]);
+        if (sig === lastSig) return;          // unchanged: do not redraw (it would wipe what you are typing)
+        lastSig = sig;
+        const area = document.getElementById('chatArea');
+        if (d.locked) {
+            area.innerHTML =
+                `<div class="hint${key ? ' bad' : ''}">${key ? 'That secret was not accepted.' : 'The conversation is private. Enter your Dummy secret to view it.'}</div>` +
+                `<div class="unlock"><input id="keyInput" type="password" placeholder="secret" autocomplete="off"><button id="keyBtn">Unlock</button></div>`;
+            const go = () => { setKey(document.getElementById('keyInput').value.trim()); lastSig = ''; pollLive(); };
+            document.getElementById('keyBtn').addEventListener('click', go);
+            document.getElementById('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+            return;
+        }
+        const log = d.conversation || [];
+        area.innerHTML = '<div class="chat-log" id="chatLog">' + (log.length
+            ? log.map(m => `<div class="chat-line ${m.speaker === 'You' ? 'you' : 'dummy'}"><span class="who">${esc(m.speaker)}</span>${esc(m.text)}</div>`).join('')
+            : '<p class="empty">nothing yet. Talk to Dummy on the laptop.</p>') + '</div>';
+        const box = document.getElementById('chatLog');
+        box.scrollTop = box.scrollHeight;
+    }
+
+    async function pollLive() {
+        try {
+            const key = getKey();
+            const res = await fetch('/api/live', { headers: key ? { 'X-API-Key': key } : {}, cache: 'no-store' });
+            const d = await res.json();
+            document.body.setAttribute('data-state', d.state);
+            document.getElementById('stateLabel').textContent = d.online ? d.state.toUpperCase() : 'LAPTOP OFFLINE';
+            document.getElementById('statusText').textContent = d.online ? 'LAPTOP ONLINE'
+                : d.last_seen === null ? 'LAPTOP OFFLINE — NOT SEEN YET'
+                : 'LAPTOP OFFLINE — LAST SEEN ' + ago(d.last_seen).toUpperCase() + ' AGO';
+            renderChat(d, key);
+        } catch (e) { /* keep the last known state if a poll fails */ }
+    }
+
+    refresh();  setInterval(refresh, 5000);
+    pollLive(); setInterval(pollLive, 1000);
     </script>
 </body>
 </html>
