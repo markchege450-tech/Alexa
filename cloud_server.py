@@ -94,8 +94,24 @@ def check_auth():
 # shows it as online while heartbeats keep arriving, offline otherwise.
 # The conversation is private: it is only returned to someone who sends the secret.
 ONLINE_SECONDS = 25
-LIVE = {"state": "idle", "conversation": [], "ts": 0.0}
+LIVE = {"state": "idle", "conversation": [], "system": None, "ts": 0.0}
 live_lock = threading.Lock()
+
+
+def _clean_system(raw):
+    """Keep only plain numbers/booleans from the laptop's system readings."""
+    if not isinstance(raw, dict):
+        return None
+
+    def num(v, hi):
+        return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= hi else None
+
+    def flag(v):
+        return v if isinstance(v, bool) else None
+    return {"battery": num(raw.get("battery"), 100), "charging": flag(raw.get("charging")),
+            "cpu": num(raw.get("cpu"), 100), "ram": num(raw.get("ram"), 100),
+            "disk": num(raw.get("disk"), 100), "disk_free_gb": num(raw.get("disk_free_gb"), 10_000_000),
+            "online": flag(raw.get("online"))}
 
 
 @app.route("/api/heartbeat", methods=["POST"])
@@ -109,7 +125,7 @@ def heartbeat():
         if isinstance(m, dict):
             convo.append({"speaker": str(m.get("speaker", ""))[:20], "text": str(m.get("text", ""))[:600]})
     with live_lock:
-        LIVE.update(state=state, conversation=convo, ts=time.time())
+        LIVE.update(state=state, conversation=convo, system=_clean_system(body.get("system")), ts=time.time())
     return jsonify({"ok": True})
 
 
@@ -125,6 +141,7 @@ def live():
         "state": snap["state"] if online else "offline",
         "last_seen": int(now - snap["ts"]) if snap["ts"] else None,
         "locked": not authorized,
+        "system": snap["system"],
     }
     if authorized:
         out["conversation"] = snap["conversation"]
@@ -515,6 +532,14 @@ DASHBOARD_HTML = """
             background: transparent; color: var(--cyan); font-family: inherit; font-size: 1em;
             border: 1px solid var(--cyan);
         }
+
+        /* ── system gauges ── */
+        .gauge { margin-bottom: 10px; }
+        .gauge .row { display: flex; justify-content: space-between; font-size: 0.78em; letter-spacing: 1px; color: #bfeeed; margin-bottom: 4px; }
+        .gauge .track { height: 6px; background: #10202b; border-radius: 3px; overflow: hidden; }
+        .gauge .fill { height: 100%; background: linear-gradient(90deg, var(--cyan), var(--magenta)); box-shadow: 0 0 8px var(--cyan); transition: width 0.6s; }
+        .gauge.warn .fill { background: var(--magenta); box-shadow: 0 0 8px var(--magenta); }
+        .gauge.warn .row { color: var(--magenta); }
     </style>
 </head>
 <body>
@@ -534,6 +559,9 @@ DASHBOARD_HTML = """
 
     <h2>Timers</h2>
     <div id="timers"><p class="empty">loading...</p></div>
+
+    <h2>System</h2>
+    <div id="system"><p class="empty">loading...</p></div>
 
     <h2>Conversation</h2>
     <div id="chatArea"><p class="empty">loading...</p></div>
@@ -556,6 +584,24 @@ DASHBOARD_HTML = """
                 ? data.timers.map(t => `<div class="card">${esc(t.label)} — <span class="time">${esc(t.remaining)}</span> left</div>`).join('')
                 : '<p class="empty">no active timers</p>';
         } catch (e) { /* keep what is on screen if a poll fails */ }
+    }
+
+
+    function gauge(label, pct, extra, warn) {
+        if (pct === null || pct === undefined) return '';
+        const n = Math.max(0, Math.min(100, Number(pct) || 0));
+        return `<div class="gauge${warn ? ' warn' : ''}"><div class="row"><span>${label}</span><span>${n}%${extra ? ' · ' + extra : ''}</span></div><div class="track"><div class="fill" style="width:${n}%"></div></div></div>`;
+    }
+    function renderSystem(sys, offline) {
+        const box = document.getElementById('system');
+        if (!sys) { box.innerHTML = `<p class="empty">${offline ? 'laptop offline' : 'no data yet'}</p>`; return; }
+        const net = sys.online === null || sys.online === undefined ? 'UNKNOWN' : (sys.online ? 'ONLINE' : 'OFFLINE');
+        box.innerHTML =
+            gauge('BATTERY', sys.battery, sys.charging ? 'CHARGING' : '', sys.battery != null && sys.battery <= 20 && !sys.charging) +
+            gauge('CPU', sys.cpu, '', sys.cpu >= 90) +
+            gauge('MEMORY', sys.ram, '', sys.ram >= 90) +
+            gauge('DISK', sys.disk, sys.disk_free_gb != null ? sys.disk_free_gb + ' GB FREE' : '', sys.disk >= 90) +
+            `<div class="hint">NETWORK: ${net}</div>`;
     }
 
     let lastSig = '';
@@ -592,6 +638,7 @@ DASHBOARD_HTML = """
                 : d.last_seen === null ? 'LAPTOP OFFLINE — NOT SEEN YET'
                 : 'LAPTOP OFFLINE — LAST SEEN ' + ago(d.last_seen).toUpperCase() + ' AGO';
             renderChat(d, key);
+            renderSystem(d.online ? d.system : null, !d.online);
         } catch (e) { /* keep the last known state if a poll fails */ }
     }
 
